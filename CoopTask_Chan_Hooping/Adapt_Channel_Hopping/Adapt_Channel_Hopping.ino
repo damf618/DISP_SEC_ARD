@@ -1,6 +1,7 @@
 // Include CoopTask since we want to manage multiple tasks.
 #include <CoopTask.h>
 #include <CoopSemaphore.h>
+#include <CoopMutex.h>
 #include "RF24.h"
 #include "RF24Network.h"
 #include "RF24Mesh.h"
@@ -9,11 +10,12 @@
 
 #define USE_BUILTIN_TASK_SCHEDULER
 
+#define DEBUG
 
 #define nodeID 2
 #define COMM_TRIES 3
 #define ALARM_GPIO 5
-#define ANALOG_LIM 30
+#define ANALOG_LIM 20
 #define RESET_GPIO 4
 #define BAUD_RATE 57600
 #define alarm_code 987
@@ -25,6 +27,7 @@
 #define CHANNEL_NO3 122
 #define N_STATES 4
 #define PERIOD_TIME 500
+#define UPDATE_TIME 300
 #define COMM_WAITING_TIME 0 
 #define COMM_ERROR_TOLERANCE 150
 #define RF_START_UP_TIME 2000
@@ -33,7 +36,9 @@
 #define INTEGER_VOLT_VAL 33
 #define N_TRIES_STATE 7
 
-
+CoopMutex serialMutex;
+CoopMutex spiMutex;
+CoopSemaphore taskSema(1, 1);
 
 uint8_t channels1[] = {CHANNEL_NO1,CHANNEL_NO2,CHANNEL_NO3};
 uint8_t channelCounter = 0;
@@ -55,107 +60,194 @@ int counter=0;
 int Code[N_STATES]={alarm_code,fail_code,normal_code,alarm_fail_code};
 String TCode[N_STATES]={"Alarma","Falla","Normal","Alarma_Falla"};
 
-void Contact_Validation(){
-
-  Alarm_State = digitalRead(ALARM_GPIO);
-    Fail_State = analogRead(analogInPin);
-    Fail_State = map(Fail_State, MIN_ANALOG_VAL, MAX_ANALOG_VAL, MIN_ANALOG_VAL, INTEGER_VOLT_VAL);
-    
-    if((Alarm_State== HIGH)||(Fail_State>=ANALOG_LIM)){
-        digitalWrite(LED_BUILTIN, HIGH);   // turn the LED on (HIGH is the voltage level)
-        Serial.println(F("ALARM and FAIL BUTTON!! "));
-    }
-    else{
-      digitalWrite(LED_BUILTIN, LOW);    // turn the LED off by making the voltage LOW
-      Serial.println(F("NORMAL_ALARM_BUTTON"));
-    }
-}
-
-
-
-// Task no.1: blink LED with 1 second delay.
-void loop1() noexcept
-{
-    for (;;) // explicitly run forever without returning
-    {
-      // Send to the master node every second
-  mesh.update();    
-  
-    Contact_Validation();
-  
-  // Send to the master node every second
-    /* ----- TASK 1 ----- */
-  if (millis() - displayTimer >= PERIOD_TIME) {
-      displayTimer = millis();
-    
-    // Send an 'M' type message containing the current millis()
-        Serial.println(F("New Cycle "));
-      for (int i=0;i<N_STATES;i++){
-          for (int j=0;j<N_TRIES_STATE;j++){
-            Serial.print("Codigo --> ");
-            Serial.println(TCode[i]);
-            Serial.print(F(" Status: "));
-          if (!mesh.write(&Code[i], 'M', sizeof(int))) {
-
-   // If a write fails, check connectivity to the mesh network
-              if ( ! mesh.checkConnection() ) {
-                counter++;
-                if(counter>=COMM_TRIES){
-                    counter=0;
-   // refresh the network address
-                    Serial.println("Renewing Address");
-                    if(!mesh.renewAddress(COMM_WAITING_TIME)){
-   // If address renewal fails, reconfigure the radio and restart the mesh
-   // This allows recovery from most if not all radio errors
-                      if(hoopingchannel==true){
-                          Serial.print("Channel: ");
-                          Serial.println(channels1[channelCounter]);
-                          mesh.begin(channels1[channelCounter],RF24_1MBPS,COMM_WAITING_TIME);
-                          channelCounter = channelCounter >= 2 ? 0 : ++channelCounter; 
-                          Max_Fails_counter++;
-                          Serial.print("ERRORES: ");
-                          Serial.println(Max_Fails_counter);
-                          if( Max_Fails_counter == COMM_ERROR_TOLERANCE)
-                  {
-                            digitalWrite(RESET_GPIO, HIGH);
-                          }
-                      }
-                      else
-                {
-                          mesh.begin(CHANNEL_NO2);
-                      }
-                    }else
-              {
-                      Serial.println("Send fail, Test OK");
-                    }
-                }
-            }
-          } else
-        {
-              Serial.println(" OK ");
-              counter=0;
-              delay(PERIOD_TIME);
-          }
-        }
-      }
-  }
-    }
-}
-
 CoopTask<void>* task1;
+CoopTask<void>* task2;
 CoopTask<void, CoopTaskStackAllocatorFromLoop<>>* taskReport;
 
+
+/* --- Rfresh the contact State ---*/
+void Contact_Validation()
+{
+  Alarm_State = digitalRead(ALARM_GPIO);
+  Fail_State = analogRead(analogInPin);
+  Fail_State = map(Fail_State, MIN_ANALOG_VAL, MAX_ANALOG_VAL, MIN_ANALOG_VAL, INTEGER_VOLT_VAL);
+    
+  if((Alarm_State== HIGH)||(Fail_State>=ANALOG_LIM))
+  {
+    digitalWrite(LED_BUILTIN, HIGH);   // turn the LED on (HIGH is the voltage level)
+#if defined(DEBUG)
+    {
+    CoopMutexLock serialLock(serialMutex);          
+    Serial.println(F("EVENT FROM ALARM or FAIL CONTACT!! "));
+    }
+#endif    
+  }
+  else
+  {
+    digitalWrite(LED_BUILTIN, LOW);    // turn the LED off by making the voltage LOW
+#if defined(DEBUG)
+    {
+    CoopMutexLock serialLock(serialMutex);          
+    Serial.println(F("NORMAL_ALARM_BUTTON"));
+    }
+#endif
+  }
+}
+
+/* --- TASK 1 Control ---*/
+void Control() noexcept
+{
+  bool val;
+  for (;;) // explicitly run forever without returning
+  {
+    taskSema.wait();
+    // Send an 'M' type message containing the current millis()
+#if defined(DEBUG)
+    {
+    CoopMutexLock serialLock(serialMutex);          
+    Serial.println(F("New Cycle "));
+    }
+#endif      
+    for (int i=0;i<N_STATES;i++)
+    {
+      for (int j=0;j<N_TRIES_STATE;j++)
+      {
+#if defined(DEBUG)
+        {
+        CoopMutexLock serialLock(serialMutex);                
+        Serial.print(F("Codigo --> "));
+        Serial.println(TCode[i]);
+        Serial.print(F(" Status: "));
+        }
+#endif  
+        {
+        CoopMutexLock Lock(spiMutex);
+        val= mesh.write(&Code[i], 'M', sizeof(int));   
+        }
+        
+        if (!val)
+        {
+          {
+          CoopMutexLock Lock(spiMutex);
+          val= mesh.checkConnection();   
+          }
+          // If a write fails, check connectivity to the mesh network
+          if ( !val )
+          {
+            counter++;
+            if(counter>=COMM_TRIES)
+            {
+              counter=0;
+              // refresh the network address
+              {
+              CoopMutexLock serialLock(serialMutex);
+              Serial.println(F("Renewing Address"));
+              }
+              {
+              CoopMutexLock Lock(spiMutex);
+              val=mesh.renewAddress(COMM_WAITING_TIME);
+              }
+              if(!val)
+              {
+                // If address renewal fails, reconfigure the radio and restart the mesh
+                // This allows recovery from most if not all radio errors
+                if(hoopingchannel==true)
+                {
+#if defined(DEBUG)
+                {
+                  CoopMutexLock serialLock(serialMutex);                          
+                  Serial.print(F("Channel: "));
+                  Serial.println(channels1[channelCounter]);
+                }
+#endif
+                  {
+                  CoopMutexLock Lock(spiMutex);
+                  mesh.begin(channels1[channelCounter],RF24_1MBPS,COMM_WAITING_TIME);
+                  }
+                  channelCounter = channelCounter >= 2 ? 0 : ++channelCounter; 
+                  Max_Fails_counter++;
+#if defined(DEBUG)
+                {
+                  CoopMutexLock serialLock(serialMutex);                        
+                  Serial.print(F("ERRORES: "));
+                  Serial.println(Max_Fails_counter);
+                }
+#endif
+                  if( Max_Fails_counter >= COMM_ERROR_TOLERANCE)
+                  {
+                    digitalWrite(RESET_GPIO, HIGH);
+                    Max_Fails_counter = 0;
+                  }
+                }
+                else
+                {
+                  {
+                  CoopMutexLock Lock(spiMutex);
+                  mesh.begin(CHANNEL_NO2);
+                  }
+                }
+             }else
+             {
+               
+              {
+              CoopMutexLock serialLock(serialMutex);
+              Serial.println(F("Send fail, Test OK"));
+              }
+             }
+           }
+         }
+       }else
+       {
+#if defined(DEBUG)
+       {
+        CoopMutexLock serialLock(serialMutex);          
+        Serial.println(" OK ");
+       }
+#endif
+       counter=0;
+       //delay(PERIOD_TIME);
+       }
+     }
+   }
+  delay(PERIOD_TIME);
+ }
+}
+
+/* --- TASK 2 Update The System---*/
+void Update_System() noexcept
+{
+   for(;;){
+    // Send to the master node every 
+    {
+    CoopMutexLock Lock(spiMutex);
+    mesh.update();
+    }
+    taskSema.post();
+    delay(UPDATE_TIME);    
+
+    // Refresh The ALARM/FAIL Contact states
+    Contact_Validation();
+   }
+}
+
+
+/* --- Stack Management ---*/
 void printStackReport(CoopTaskBase* task)
 {
-    if (!task) return;
-    Serial.print(task->name().c_str());
-    Serial.print(" free stack = ");
-    Serial.println(task->getFreeStack());
+  if (!task)
+    return;
+  {
+  CoopMutexLock serialLock(serialMutex);  
+  Serial.print(task->name().c_str());
+  Serial.print(F(" free stack = "));
+  Serial.println(task->getFreeStack());
+  }
 }
 
 void printReport()
 {
    printStackReport(task1);
+   printStackReport(task2);
 }
 
 // Task no.2: Report of available stack.
@@ -163,7 +255,6 @@ void loop4() noexcept
 {
     for (;;) // explicitly run forever without returning
     {
-        
         delay(5000);
         printReport();
         yield();
@@ -183,28 +274,32 @@ void setup() {
   Serial.println(F("Connecting to the mesh..."));
   mesh.begin(CHANNEL_NO2,RF24_1MBPS,RF_START_UP_TIME);
 
-  
-  task1 = new CoopTask<void>(F("Task1"), loop1,0x5DC); //400 FREE
+  task1 = new CoopTask<void>(F("Task1"), Control,0x5DC); //400 FREE
   if (!*task1)
     Serial.println("CoopTask T1 out of stack");
+    
+  task2 = new CoopTask<void>(F("Task1"), Update_System,0x400); 
+  if (!*task2)
+    Serial.println("CoopTask T2 out of stack");  
+  
   taskReport = new CoopTask<void, CoopTaskStackAllocatorFromLoop<>>(F("TaskReport"), loop4,0x400);
   if (!*taskReport)
     Serial.println("CoopTask T4 out of stack");
+    
   CoopTaskBase::useBuiltinScheduler();
+    
+  if (!task1->scheduleTask())
+    Serial.printf("Could not schedule task %s\n", task1->name().c_str());
+    
+  if (!task2->scheduleTask())
+    Serial.printf("Could not schedule task %s\n", task2->name().c_str());  
   
-   if (!task1->scheduleTask())
-   {
-      Serial.printf("Could not schedule task %s\n", task1->name().c_str());
-   }
-  
-   if (!taskReport->scheduleTask())
-   {
-      Serial.printf("Could not schedule task %s\n", taskReport->name().c_str());
-   }
-
+  if (!taskReport->scheduleTask())
+    Serial.printf("Could not schedule task %s\n", taskReport->name().c_str());
 }
 
-void loop() {
+void loop()
+{
   // put your main code here, to run repeatedly:
   runCoopTasks();
 }
