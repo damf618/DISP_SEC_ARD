@@ -12,6 +12,9 @@
 
 #define DEBUG
 
+//#define ESP8266
+#define UNO
+
 #define nodeID 2
 #define COMM_TRIES 3
 #define ALARM_GPIO 5
@@ -54,6 +57,7 @@ typedef struct struct_s {
   uint8_t Fail_State;
 }disp_sec_t;
 
+
 RF24 radio((int)16,(int)0);
 RF24Network network(radio);
 RF24Mesh mesh(radio, network);
@@ -66,6 +70,7 @@ const String TCode[N_STATES]={"Alarma","Falla","Normal","Alarma_Falla"};
 
 CoopMutex serialMutex;
 CoopMutex spiMutex;
+
 CoopSemaphore taskUpdate(1,1);
 CoopSemaphore RF_Maintenance(1,1);
 
@@ -78,26 +83,26 @@ bool RF_Send(disp_sec_t * sec,int i)
 {
   bool rtn = FALSE;
   {
-    CoopMutexLock Lock(spiMutex);
-    rtn= mesh.write(&Code[i], 'M', sizeof(int));   
-    }
+  CoopMutexLock Lock(spiMutex);
+  rtn= mesh.write(&Code[i], 'M', sizeof(int));   
+  }
   return rtn;
 }
 
 void MESH_CONNECT_OK()
 {
   {
-    CoopMutexLock serialLock(serialMutex);                
-    Serial.println(F("Message was not Sent, TEST OK!"));
-    }   
+  CoopMutexLock serialLock(serialMutex);                
+  Serial.println(F("Message was not Sent, TEST OK!"));
+  }   
 }
 
 void MESSAGE_SENT_OK()
 {
   {
-    CoopMutexLock serialLock(serialMutex);                
-    Serial.print(F("Message Sent"));
-    }   
+  CoopMutexLock serialLock(serialMutex);                
+  Serial.print(F("Message Sent"));
+  }   
 }
 
 bool Send_Maintenance_Validation(disp_sec_t * sec)
@@ -135,22 +140,22 @@ void Send_Validation(disp_sec_t * sec, bool arg1)
   bool val = FALSE;
   if (!arg1)
   {
-  // If a write fails, check connectivity to the mesh network  
-  {
-  CoopMutexLock Lock(spiMutex);
-  val= mesh.checkConnection();   
-  }
-  if (val)
-  {
-    //No message sent but RF Connectivity OK!
-    MESH_CONNECT_OK();
-    sec->state=RECOVERY;
-  }
-  else
-  {
-    //No mesh connection!
-    sec->state=RF_MANAGER;
-  }
+    // If a write fails, check connectivity to the mesh network  
+    {
+    CoopMutexLock Lock(spiMutex);
+    val= mesh.checkConnection();   
+    }
+    if (val)
+    {
+      //No message sent but RF Connectivity OK!
+      MESH_CONNECT_OK();
+      sec->state=RECOVERY;
+    }
+    else
+    {
+      //No mesh connection!
+      sec->state=RF_MANAGER;
+    }
   }
   else
   {
@@ -225,6 +230,7 @@ void RF_Comm_Task () noexcept
 #endif    
     continue;
     }
+    // Modifications of sec internals values will be made
     WRITING_FSM(&sec,i);
     delay(RF_COMM_TIME);
     }
@@ -236,13 +242,22 @@ void RF_Comm_Task () noexcept
 /* --- Refresh the contact State ---*/
 void Contact_Validation(disp_sec_t * sec)
 {
+  int sensorValue;
   sec->Alarm_State = digitalRead(ALARM_GPIO);
-  sec->Fail_State = analogRead(analogInPin);
-  sec->Fail_State = map(sec->Fail_State, MIN_ANALOG_VAL, MAX_ANALOG_VAL, MIN_ANALOG_VAL, INTEGER_VOLT_VAL);
-    
+  sensorValue = analogRead(analogInPin);
+  sec->Fail_State = map(sensorValue, MIN_ANALOG_VAL, MAX_ANALOG_VAL, MIN_ANALOG_VAL, INTEGER_VOLT_VAL);
+#if defined(DEBUG)
+  {
+  CoopMutexLock serialLock(serialMutex);                
+  Serial.print(F("\n Analog Read: "));
+  Serial.println(sensorValue);
+  Serial.print(F("\n Conversion Read: "));      
+  Serial.println(sec->Fail_State);
+  }
+#endif      
   if((sec->Alarm_State== HIGH)||(sec->Fail_State>=ANALOG_LIM))
   {
-    digitalWrite(LED_BUILTIN, HIGH);   // turn the LED on (HIGH is the voltage level)
+    digitalWrite(LED_BUILTIN, HIGH);   // turn the LED on (HIGH is the voltage level);
 #if defined(DEBUG)
     {
     CoopMutexLock serialLock(serialMutex);          
@@ -379,6 +394,7 @@ void RF_Maintenance_Task() noexcept
   }
 }
 
+#if defined(DEBUG)
 /* --- Stack Management ---*/
 void printStackReport(CoopTaskBase* task)
 {
@@ -409,6 +425,7 @@ void Stack_Management() noexcept
     yield();
   }
 }
+#endif
 
 void setup() {
   pinMode(RESET_GPIO, OUTPUT);
@@ -433,35 +450,38 @@ void setup() {
   Serial.println(F("Connecting to the mesh..."));
   mesh.begin(CHANNEL_NO2,RF24_1MBPS,RF_START_UP_TIME);
 
-  task1 = new CoopTask<void>(F("Task1"), RF_Comm_Task,0x410); // 136 FREE
+  task1 = new CoopTask<void>(F("Task1"), RF_Comm_Task,0x410); // 184 FREE
   if (!*task1)
-    Serial.println("CoopTask T1 out of stack");
+    Serial.println(F("CoopTask T1 out of stack"));
     
-  task2 = new CoopTask<void>(F("Task2"), Update_Task,0x370); // 168 FREE
+  task2 = new CoopTask<void>(F("Task2"), Update_Task,0x410); // 40 FREE
   if (!*task2)
-    Serial.println("CoopTask T2 out of stack");  
+    Serial.println(F("CoopTask T2 out of stack"));  
     
-  task3 = new CoopTask<void>(F("Task3"), RF_Maintenance_Task,0x500); // 152 FREE 
+  task3 = new CoopTask<void>(F("Task3"), RF_Maintenance_Task,0x5C8); // 8 FREE 
   if (!*task3)
-    Serial.println("CoopTask T3 out of stack");   
-  
-  taskReport = new CoopTask<void, CoopTaskStackAllocatorFromLoop<>>(F("TaskReport"), Stack_Management,0x400);
-  if (!*taskReport)
-    Serial.println("CoopTask T4 out of stack");
-    
+    Serial.println(F("CoopTask T3 out of stack"));   
+
   CoopTaskBase::useBuiltinScheduler();
-    
+
   if (!task1->scheduleTask())
-    Serial.printf("Could not schedule task %s\n", task1->name().c_str());
-    
+    //Serial.printf("Could not schedule task %s\n", task1->name().c_str());
+    Serial.println(F("CoopTask T1 not scheduled"));  
+          
   if (!task2->scheduleTask())
-    Serial.printf("Could not schedule task %s\n", task2->name().c_str());  
+    Serial.println(F("CoopTask T2 not scheduled"));  
 
   if (!task3->scheduleTask())
-    Serial.printf("Could not schedule task %s\n", task2->name().c_str());  
+    Serial.println(F("CoopTask T3 not scheduled"));    
+
+#if defined(DEBUG)
+  taskReport = new CoopTask<void, CoopTaskStackAllocatorFromLoop<>>(F("TaskReport"), Stack_Management,0x400);
+  if (!*taskReport)
+    Serial.println(F("CoopTask Print Report out of stack"));
   
   if (!taskReport->scheduleTask())
-    Serial.printf("Could not schedule task %s\n", taskReport->name().c_str());
+    Serial.println(F("Could not schedule the Print Report Task"));
+#endif
 }
 
 void loop()
