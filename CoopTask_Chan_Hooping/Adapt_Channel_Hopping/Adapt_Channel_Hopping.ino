@@ -7,13 +7,9 @@
 #include "RF24Mesh.h"
 #include <SPI.h>
 
-
 #define USE_BUILTIN_TASK_SCHEDULER
 
 #define DEBUG
-
-//#define ESP8266
-#define UNO
 
 #define nodeID 2
 #define COMM_TRIES 3
@@ -39,14 +35,17 @@
 #define INTEGER_VOLT_VAL 33
 #define N_TRIES_STATE 7
 #define RECOVERY_TIME 15
-#define RF_COMM_TIME 15
+#define RF_COMM_TIME 30
 #define TRUE 1
 #define FALSE 0
 
 typedef enum RF_FSM_s { SEND, RF_MANAGER, RECOVERY}RF_FSM_t;
 typedef enum RF_MAINT_FSM_s { TRYING, RENEWING, RESET}RF_MAINT_FSM_t;
+typedef enum SEC_STATE_s { NORMAL_STATE, FAIL_STATE, ALARM_STATE, ALARM_FAIL_STATE}SEC_STATE_t;
 
-typedef struct struct_s {
+typedef struct struct_s 
+{
+  SEC_STATE_t sec_state;  
   bool Maintenance;
   RF_FSM_t state;
   RF_MAINT_FSM_t mstate;
@@ -58,7 +57,7 @@ typedef struct struct_s {
 }disp_sec_t;
 
 
-RF24 radio((int)16,(int)0);
+RF24 radio(16,0);
 RF24Network network(radio);
 RF24Mesh mesh(radio, network);
 
@@ -79,12 +78,44 @@ CoopTask<void>* task2;
 CoopTask<void>* task3;
 CoopTask<void, CoopTaskStackAllocatorFromLoop<>>* taskReport;
 
-bool RF_Send(disp_sec_t * sec,int i)
+int Code_Traslation (SEC_STATE_t state){
+  
+  int rtn;
+  
+  switch(state){
+    case ALARM_FAIL_STATE:
+    rtn=Code[3];  
+      break;
+    case ALARM_STATE:
+      rtn=Code[0];
+      break;  
+    case FAIL_STATE:
+      rtn=Code[1];    
+      break;  
+    case NORMAL_STATE:
+      rtn=Code[2];
+    break;      
+  }
+  return rtn;  
+}
+
+bool RF_Send(disp_sec_t * sec)
 {
+  int val;
   bool rtn = FALSE;
+  val=Code_Traslation(sec->sec_state);
+#if defined(DEBUG)
+  {
+  CoopMutexLock serialLock(serialMutex);                
+  Serial.print(F("Code to Send: "));
+  Serial.println(val);   
+  Serial.print(F("State: "));
+  Serial.println(sec->sec_state);   
+  }
+#endif  
   {
   CoopMutexLock Lock(spiMutex);
-  rtn= mesh.write(&Code[i], 'M', sizeof(int));   
+  rtn= mesh.write(&val, 'M', sizeof(int));   
   }
   return rtn;
 }
@@ -179,12 +210,16 @@ void RF_Validation(disp_sec_t * sec)
   sec->state=SEND;
 }
 
-void WRITING_FSM(disp_sec_t * sec, int i){
+void WRITING_FSM(disp_sec_t * sec)
+{
+  bool val;
+  
   switch (sec->state){
     case SEND:
     //If there was an update, then we send the status
       taskUpdate.wait();
-      Send_Validation(sec, RF_Send(sec,i));
+      val=RF_Send(sec);  
+      Send_Validation(sec, val);
       break;
     case RF_MANAGER:
       RF_Validation(sec);
@@ -205,20 +240,8 @@ void RF_Comm_Task () noexcept
 #if defined(DEBUG)
     {
     CoopMutexLock serialLock(serialMutex);          
-    Serial.println(F("New Cycle "));
+    Serial.println(F(" RF Send "));
     }
-#endif      
-    for (int i=0;i<N_STATES;i++)
-    {
-      for (int j=0;j<N_TRIES_STATE;j++)
-      {
-#if defined(DEBUG)
-        {
-        CoopMutexLock serialLock(serialMutex);                
-        Serial.print(F("Codigo --> "));
-        Serial.println(TCode[i]);
-        Serial.print(F(" Status: "));
-        }
 #endif
     if(Send_Maintenance_Validation(&sec))
     {
@@ -231,21 +254,21 @@ void RF_Comm_Task () noexcept
     continue;
     }
     // Modifications of sec internals values will be made
-    WRITING_FSM(&sec,i);
+    WRITING_FSM(&sec);
     delay(RF_COMM_TIME);
     }
-  }  
-  }
-
 }
 
-/* --- Refresh the contact State ---*/
-void Contact_Validation(disp_sec_t * sec)
+SEC_STATE_t Digital_Validation(disp_sec_t * sec)
 {
+  
   int sensorValue;
+  SEC_STATE_t rtn;
+    
   sec->Alarm_State = digitalRead(ALARM_GPIO);
   sensorValue = analogRead(analogInPin);
-  sec->Fail_State = map(sensorValue, MIN_ANALOG_VAL, MAX_ANALOG_VAL, MIN_ANALOG_VAL, INTEGER_VOLT_VAL);
+  sec->Fail_State = map(sensorValue, MIN_ANALOG_VAL, MAX_ANALOG_VAL, MIN_ANALOG_VAL, INTEGER_VOLT_VAL); 
+
 #if defined(DEBUG)
   {
   CoopMutexLock serialLock(serialMutex);                
@@ -255,27 +278,84 @@ void Contact_Validation(disp_sec_t * sec)
   Serial.println(sec->Fail_State);
   }
 #endif      
-  if((sec->Alarm_State== HIGH)||(sec->Fail_State>=ANALOG_LIM))
+  
+  
+  if((sec->Alarm_State== HIGH)&&(sec->Fail_State>=ANALOG_LIM))
   {
-    digitalWrite(LED_BUILTIN, HIGH);   // turn the LED on (HIGH is the voltage level);
-#if defined(DEBUG)
-    {
-    CoopMutexLock serialLock(serialMutex);          
-    Serial.println(F("EVENT FROM ALARM or FAIL CONTACT!! "));
-    }
-#endif    
+    rtn = ALARM_FAIL_STATE;
+    digitalWrite(LED_BUILTIN, HIGH);   // turn the LED on (HIGH is the voltage level)
+  }
+  else if(sec->Alarm_State== HIGH)
+  {
+    rtn = ALARM_STATE;
+    digitalWrite(LED_BUILTIN, HIGH);   // turn the LED on (HIGH is the voltage level)    
+  }
+  else if(sec->Fail_State>=ANALOG_LIM)
+  {
+    rtn = FAIL_STATE;
+    digitalWrite(LED_BUILTIN, HIGH);   // turn the LED on (HIGH is the voltage level)  
   }
   else
   {
+    rtn = NORMAL_STATE;
     digitalWrite(LED_BUILTIN, LOW);    // turn the LED off by making the voltage LOW
-#if defined(DEBUG)
-    {
-    CoopMutexLock serialLock(serialMutex);          
-    Serial.println(F("NORMAL_ALARM_BUTTON"));
-    }
-#endif
   }
-    taskUpdate.post();
+  return rtn;
+}
+
+
+/* --- Refresh the contact State ---*/
+void Contact_Validation(disp_sec_t * sec)
+{
+  SEC_STATE_t state;
+  state = Digital_Validation(sec);
+  switch(state)
+  {
+    case(ALARM_FAIL_STATE):
+      sec->sec_state= ALARM_FAIL_STATE;
+#if defined(DEBUG)
+      {
+      CoopMutexLock serialLock(serialMutex);          
+      Serial.println(F("ALARM AND FAIL EVENT!"));
+      }
+#endif    
+      break;
+    case(ALARM_STATE):
+      sec->sec_state= ALARM_STATE;
+#if defined(DEBUG)
+      {
+      CoopMutexLock serialLock(serialMutex);          
+      Serial.println(F("ALARM EVENT!"));
+      }
+#endif      
+      break;
+    case(FAIL_STATE):
+      sec->sec_state= FAIL_STATE;
+#if defined(DEBUG)
+      {
+      CoopMutexLock serialLock(serialMutex);          
+      Serial.println(F("FAIL EVENT!"));
+      }
+#endif  
+      break; 
+    case(NORMAL_STATE):
+      sec->sec_state= NORMAL_STATE;
+#if defined(DEBUG)
+      {
+      CoopMutexLock serialLock(serialMutex);          
+      Serial.println(F("NORMAL STATE"));
+      }
+#endif
+      break;
+    default:
+      sec->sec_state= FAIL_STATE;
+      {
+      CoopMutexLock serialLock(serialMutex);          
+      Serial.println(F("UNDEFINED STATE!"));
+      }
+      break;   
+  }
+  taskUpdate.post();
 }
 
 /* --- TASK 2 Update The System ---*/
@@ -303,7 +383,8 @@ void RF_Error_Handler (disp_sec_t * sec)
   }  
 } 
 
-void RF_Refresh(disp_sec_t * sec){
+void RF_Refresh(disp_sec_t * sec)
+{
   bool val=FALSE;
   {
   CoopMutexLock serialLock(serialMutex);
@@ -356,7 +437,8 @@ void FULL_SYSTEM_RESET(disp_sec_t * sec)
   sec->mstate=TRYING;
 }
 
-void MAINTENANCE_FSM(disp_sec_t * sec){
+void MAINTENANCE_FSM(disp_sec_t * sec)
+{
   switch (sec->mstate){
     case TRYING:
     RF_Error_Handler(sec);
@@ -427,7 +509,8 @@ void Stack_Management() noexcept
 }
 #endif
 
-void setup() {
+void setup()
+{
   pinMode(RESET_GPIO, OUTPUT);
   pinMode(ALARM_GPIO, INPUT);
   pinMode(LED_BUILTIN, OUTPUT);
